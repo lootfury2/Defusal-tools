@@ -1,0 +1,104 @@
+import tkinter as tk
+import threading
+import time
+import win32api
+import win32con
+from PIL import ImageGrab
+
+#teams
+RED = [(193, 25, 21), (152, 15, 42)]
+BLUE= [(33, 212, 246), (105, 110, 227), (1, 147, 195)]
+
+class TriggerbotGUI:
+    def __init__(self, main):
+        self.root = main
+        self.root.title("lootfury v1.0")
+        self.root.geometry("300x300")
+        self.root.attributes("-topmost", True)
+
+        # the settings
+        self.is_running = False
+        self.enemy_targets = RED 
+        self.center_x, self.center_y = 960, 527 # center of my 1080p screen
+        self.region_size = 12
+        self.tolerance = 40
+
+        # the ui of the triggerbot
+        tk.Label(main, text="--- MANUAL CONTROLS ---", font=("Arial", 10, "bold")).pack(pady=10)
+        
+        self.status_label = tk.Label(main, text="BOT: OFF", fg="red", font=("Arial", 14, "bold"))
+        self.status_label.pack(pady=5)
+
+        self.team_label = tk.Label(main, text="TARGETING: RED", fg="red", font=("Arial", 12, "bold"))
+        self.team_label.pack(pady=10)
+
+        tk.Label(main, text="[F1] Toggle Bot\n[J] Target RED (Militia)\n[K] Target BLUE (Operators)", justify="center", fg="gray").pack(pady=10)
+
+        # background threads allow for multiple tasks to happen
+        threading.Thread(target=self.bot_loop, daemon=True).start()
+        threading.Thread(target=self.hotkey_listener, daemon=True).start()
+
+    def set_red(self):
+        self.enemy_targets = RED
+        self.team_label.config(text="TARGETING: RED", fg="red")
+        win32api.Beep(500, 100)
+
+    def set_blue(self):
+        self.enemy_targets = BLUE
+        self.team_label.config(text="TARGETING: BLUE", fg="blue")
+        win32api.Beep(1000, 100)
+
+    def toggle_bot(self):
+        self.is_running = not self.is_running
+        self.status_label.config(text="BOT: ON" if self.is_running else "BOT: OFF", 
+                                 fg="green" if self.is_running else "red")
+        win32api.Beep(1200 if self.is_running else 400, 150)
+
+    def hotkey_listener(self):
+        """Listens for J, K, and F1 keys globally."""
+        while True:
+            if win32api.GetAsyncKeyState(ord('J')):
+                self.set_red()
+                time.sleep(0.3) # Prevent repeat
+            if win32api.GetAsyncKeyState(ord('K')):
+                self.set_blue()
+                time.sleep(0.3)
+            if win32api.GetAsyncKeyState(win32con.VK_F1):
+                self.toggle_bot()
+                time.sleep(0.3)
+            time.sleep(0.01)
+
+    def bot_loop(self):
+        """Main firing logic."""
+        while True:
+            if self.is_running:
+                # Capture the small area around the crosshair
+                bbox = (self.center_x - self.region_size, self.center_y - self.region_size, 
+                        self.center_x + self.region_size, self.center_y + self.region_size)
+                img = ImageGrab.grab(bbox)
+                pixels = img.load()
+                
+                fire = False
+                # Scan pixels in the captured box
+                for x in range(0, img.size[0], 3):
+                    for y in range(0, img.size[1], 3):
+                        r, g, b = pixels[x, y]
+                        for target in self.enemy_targets:
+                            tr, tg, tb = target
+                            if abs(r-tr) <= self.tolerance and abs(g-tg) <= self.tolerance and abs(b-tb) <= self.tolerance:
+                                fire = True; break
+                        if fire: break
+                    if fire: break
+
+                if fire:
+                    win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+                    time.sleep(0.01)
+                    win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+                    time.sleep(0.01) # fire rate
+            
+            time.sleep(0.005)
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = TriggerbotGUI(root)
+    root.mainloop()

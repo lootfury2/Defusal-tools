@@ -1,0 +1,266 @@
+import tkinter as tk
+import threading
+import time
+import cv2
+import numpy as np
+import win32api
+import win32con
+import win32gui
+from mss import mss
+from PIL import Image, ImageTk
+import colorsys 
+
+# paste your actual checked hsv array parameters here
+BLUE_LOWER = np.array([85, 100, 100])   
+BLUE_UPPER = np.array([130, 255, 255])  
+RED_LOWER1 = np.array([0, 100, 100])    
+RED_UPPER1 = np.array([10, 255, 255])   
+RED_LOWER2 = np.array([170, 100, 100])    
+RED_UPPER2 = np.array([180, 255, 255])   
+
+is_running = False
+show_tracking = False  
+enemy_targets = "RED" 
+rainbow_hue = 0.0 
+
+center_x = 960
+center_y = 515        
+max_grab_size = 180   
+
+raw_bgr_frame = None  
+live_zoom_crop = 180   
+overlay_box = [0, 0, 0, 0, False]
+
+frame_lock = threading.Lock()
+coords_lock = threading.Lock()
+
+def set_red():
+    global enemy_targets
+    enemy_targets = "RED"
+    team_label.config(text="swiss cheesing: RED TEAM", fg="red")
+    win32api.Beep(500, 100)
+
+def set_blue():
+    global enemy_targets
+    enemy_targets = "BLUE"
+    team_label.config(text="swiss cheesing: BLUE TEAM", fg="blue")
+    win32api.Beep(1000, 100)
+
+def toggle_bot():
+    global is_running
+    is_running = not is_running
+    if not is_running:
+        status_label.config(text="fire: OFF", fg="red")
+    win32api.Beep(1200 if is_running else 400, 150)
+
+def animate_rainbow():
+    global rainbow_hue
+    if is_running:
+        rainbow_hue += 0.02
+        if rainbow_hue > 1.0:
+            rainbow_hue = 0.0
+        r, g, b = colorsys.hsv_to_rgb(rainbow_hue, 1.0, 1.0)
+        hex_color = f"#{int(r*255):02x}{int(g*255):02x}{int(b*255):02x}"
+        status_label.config(text="fire: ON", fg=hex_color)
+    root.after(30, animate_rainbow) 
+
+def toggle_tracking():
+    global show_tracking, raw_bgr_frame, overlay_box
+    show_tracking = not show_tracking
+    track_label.config(text="live view: ACTIVE" if show_tracking else "live view: HIDDEN", 
+                       fg="green" if show_tracking else "gray")
+    if not show_tracking:
+        video_panel.config(image="")
+        video_panel.image = None
+        with frame_lock:
+            raw_bgr_frame = None
+        with coords_lock:
+            overlay_box = [0, 0, 0, 0, False]
+    win32api.Beep(800, 100)
+
+def hotkey_listener():
+    while True:
+        if win32api.GetAsyncKeyState(ord('J')):
+            set_red()
+            time.sleep(0.3) 
+        if win32api.GetAsyncKeyState(ord('K')):
+            set_blue()
+            time.sleep(0.3)
+        if win32api.GetAsyncKeyState(win32con.VK_F1):
+            toggle_bot()
+            time.sleep(0.3)
+        if win32api.GetAsyncKeyState(ord('V')):
+            toggle_tracking()
+            time.sleep(0.3)
+        time.sleep(0.01)
+
+def update_gui_stream():
+    global raw_bgr_frame, live_zoom_crop
+    if show_tracking:
+        snapshot = None
+        with frame_lock:
+            if raw_bgr_frame is not None:
+                snapshot = raw_bgr_frame.copy()
+        
+        if snapshot is not None:
+            y_start = max_grab_size - live_zoom_crop
+            y_end = max_grab_size + live_zoom_crop
+            x_start = max_grab_size - live_zoom_crop
+            x_end = max_grab_size + live_zoom_crop
+            
+            cropped = snapshot[y_start:y_end, x_start:x_end]
+            rgb = cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB)
+            resized_view = cv2.resize(rgb, (220, 220), interpolation=cv2.INTER_LINEAR)
+            
+            img_pil = Image.fromarray(resized_view)
+            img_tk = ImageTk.PhotoImage(image=img_pil)
+            
+            video_panel.config(image=img_tk)
+            video_panel.image = img_tk  
+            
+    root.after(33, update_gui_stream)
+
+def create_overlay():
+    try:
+        overlay = tk.Toplevel()
+        overlay.title("OverlayLayer")
+        overlay.config(bg='#000001')
+        overlay.attributes("-transparentcolor", '#000001')
+        overlay.attributes("-topmost", True)
+        overlay.geometry(f"{win32api.GetSystemMetrics(0)}x{win32api.GetSystemMetrics(1)}+0+0")
+        overlay.overrideredirect(True) 
+
+        hwnd = win32gui.FindWindow(None, "OverlayLayer")
+        extended_style = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
+        win32gui.SetWindowLong(hwnd, win32con.GWL_EXSTYLE, extended_style | win32con.WS_EX_TRANSPARENT | win32con.WS_EX_LAYERED)
+
+        canvas = tk.Canvas(overlay, width=win32api.GetSystemMetrics(0), height=win32api.GetSystemMetrics(1), bg='#000001', highlightthickness=0)
+        canvas.pack()
+
+        def draw_loop():
+            canvas.delete("all") 
+            if show_tracking:
+                with coords_lock:
+                    box_x, box_y, box_w, box_h, active = overlay_box
+                if active:
+                    canvas.create_rectangle(box_x, box_y, box_x + box_w, box_y + box_h, outline="#00FF00", width=2)
+                    canvas.create_rectangle(center_x - 8, center_y - 4, center_x + 8, center_y + 35, outline="#FFFF00", width=1)
+            overlay.after(10, draw_loop) 
+
+        draw_loop()
+    except Exception as e:
+        print(f"Overlay initialization skipped: {e}")
+
+def bot_loop():
+    global raw_bgr_frame, live_zoom_crop, overlay_box
+    with mss() as sct:
+        while True:
+            monitor = {
+                "top": center_y - max_grab_size,
+                "left": center_x - max_grab_size,
+                "width": max_grab_size * 2,
+                "height": max_grab_size * 2
+            }
+            
+            img = np.array(sct.grab(monitor))
+            bgr = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+            hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+            
+            if enemy_targets == "BLUE":
+                mask = cv2.inRange(hsv, BLUE_LOWER, BLUE_UPPER)
+            else:
+                mask1 = cv2.inRange(hsv, RED_LOWER1, RED_UPPER1)
+                mask2 = cv2.inRange(hsv, RED_LOWER2, RED_UPPER2)
+                mask = cv2.bitwise_or(mask1, mask2)
+            
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            fire = False
+            found_target = False
+            best_contour = None
+            max_area = 0
+            
+            x_pad, y_pad_up, y_pad_down, local_zoom = 8, 4, 45, 18
+            
+            for contour in contours:
+                area = cv2.contourArea(contour)
+                if area > 4000:
+                    x_pad, y_pad_down, min_allowed_size, local_zoom = 8, 120, 500, 180
+                elif area > 1000:
+                    x_pad, y_pad_down, min_allowed_size, local_zoom = 8, 60, 150, 110
+                else:
+                    x_pad, y_pad_down, min_allowed_size, local_zoom = 14, 35, 8, 50
+
+                if area > min_allowed_size:
+                    if area > max_area:
+                        max_area = area
+                        best_contour = (contour, x_pad, y_pad_down, local_zoom)
+
+            if best_contour is not None:
+                contour, x_pad, y_pad_down, local_zoom = best_contour
+                x, y, w, h = cv2.boundingRect(contour)
+                
+                center_x_min = max_grab_size - x_pad
+                center_x_max = max_grab_size + x_pad
+                center_y_min = max_grab_size - y_pad_up
+                center_y_max = max_grab_size + y_pad_down
+                
+                if (x <= center_x_max and (x + w) >= center_x_min) and (y <= center_y_max and (y + h) >= center_y_min):
+                    fire = True
+                
+                if show_tracking:
+                    live_zoom_crop = local_zoom
+                    cv2.rectangle(bgr, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                    
+                    actual_screen_x = (center_x - max_grab_size) + x
+                    actual_screen_y = (center_y - max_grab_size) + y
+                    with coords_lock:
+                        overlay_box = [actual_screen_x, actual_screen_y, w, h, True]
+                    found_target = True
+
+            if show_tracking:
+                if not found_target:
+                    live_zoom_crop = 180 
+                    with coords_lock:
+                        overlay_box = [0, 0, 0, 0, False]
+                
+                cv2.rectangle(bgr, (max_grab_size - x_pad, max_grab_size - y_pad_up), (max_grab_size + x_pad, max_grab_size + y_pad_down), (255, 255, 0), 1)
+                cv2.circle(bgr, (max_grab_size, max_grab_size), 2, (255, 0, 255), -1)
+                with frame_lock:
+                    raw_bgr_frame = bgr
+            
+            if is_running and fire:
+                win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+                time.sleep(0.01)
+                win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+                time.sleep(0.05) 
+                    
+            time.sleep(0.001)
+
+root = tk.Tk()
+root.title("beat them mobile players")
+root.geometry("340x560") 
+root.attributes("-topmost", True)
+
+tk.Label(root, text="triggerbot with vision", font=("Arial", 10, "bold")).pack(pady=8)
+status_label = tk.Label(root, text="fire: OFF", fg="red", font=("Arial", 14, "bold"))
+status_label.pack(pady=4)
+team_label = tk.Label(root, text="swiss cheesing: RED TEAM", fg="red", font=("Arial", 12, "bold"))
+team_label.pack(pady=4)
+track_label = tk.Label(root, text="live view: hidden for now", fg="gray", font=("Arial", 10))
+track_label.pack(pady=4)
+
+video_panel = tk.Label(root)
+video_panel.pack(pady=5)
+
+tk.Label(root, text="[F1] toggle rapid fire execution\n[J] target RED team\n[K] target BLUE team\n[V] toggle dual live-view & overlay", 
+         justify="center", fg="black", font=("Arial", 9)).pack(pady=10)
+
+threading.Thread(target=bot_loop, daemon=True).start()
+threading.Thread(target=hotkey_listener, daemon=True).start()
+
+update_gui_stream()
+animate_rainbow() 
+
+root.after(100, create_overlay)
+root.mainloop()
